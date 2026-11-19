@@ -35,6 +35,7 @@ function sendRaw(res: ServerResponse, status: number, body: Buffer | null, heade
     h['content-length'] = String(body.length);
     if (!h['content-type']) h['content-type'] = JSON_TYPE;
   }
+  res.sendDate = false;
   res.writeHead(status, h);
   if (body !== null) res.end(body); else res.end();
 }
@@ -491,7 +492,7 @@ function routeIssuesPulls(
 export function createApp(): Server {
   const store = new Store();
 
-  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
       const method = (req.method || 'GET').toUpperCase();
       const rawUrl = req.url ?? '/';
@@ -626,6 +627,13 @@ export function createApp(): Server {
       } catch {}
     }
   });
+
+  server.keepAliveTimeout = 60000;
+  server.headersTimeout = 65000;
+  server.requestTimeout = 0;
+  server.maxRequestsPerSocket = 0;
+
+  return server;
 }
 
 async function routeApiV3(
