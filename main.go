@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 )
@@ -114,11 +116,10 @@ func run() error {
 		return fmt.Errorf("the server did not bind an ephemeral TCP port")
 	}
 
-	server := &http.Server{Handler: NewServer(store)}
-	server.SetKeepAlivesEnabled(true)
+	server := newRawServer(listener, NewServer(store))
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- server.Serve(listener)
+		serveErr <- server.Serve()
 	}()
 
 	port := addr.Port
@@ -135,16 +136,15 @@ func run() error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		server.Close()
-	}
+	_ = server.Close()
 	os.Stdout.WriteString("[entry] done\n")
 	return nil
 }
 
 func main() {
+	debug.SetGCPercent(800)
+	debug.SetMemoryLimit(768 << 20)
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	if err := run(); err != nil {
 		os.Stderr.WriteString("[entry] " + err.Error() + "\n")
 		os.Exit(1)

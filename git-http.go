@@ -28,6 +28,7 @@ const (
 var (
 	flushPktBytes = []byte("0000")
 	delimPktBytes = []byte("0001")
+	sidebandCap   = []byte("side-band-64k")
 )
 
 const maxPackCacheEntries = 32
@@ -39,18 +40,21 @@ type packEntry struct {
 }
 
 type responseCache struct {
-	mu       sync.Mutex
-	rev      string
-	packs    map[string]packEntry
-	order    []string
-	uploadV2 []byte
-	receive  []byte
-	lsRefs   map[string][]byte
-	lsOrder  []string
+	mu         sync.Mutex
+	rev        string
+	packs      map[string]packEntry
+	order      []string
+	fetch      map[string][]byte
+	fetchOrder []string
+	uploadV2   []byte
+	receive    []byte
+	lsRefs     map[string][]byte
+	lsOrder    []string
 }
 
 var gitCache = &responseCache{
 	packs:  make(map[string]packEntry),
+	fetch:  make(map[string][]byte),
 	lsRefs: make(map[string][]byte),
 }
 
@@ -72,6 +76,8 @@ func (c *responseCache) resetLocked(rev string) {
 	c.rev = rev
 	c.packs = make(map[string]packEntry)
 	c.order = c.order[:0]
+	c.fetch = make(map[string][]byte)
+	c.fetchOrder = c.fetchOrder[:0]
 	c.uploadV2 = nil
 	c.receive = nil
 	c.lsRefs = make(map[string][]byte)
@@ -218,6 +224,71 @@ func isHex4(s string) bool {
 		}
 	}
 	return true
+}
+
+type pktView struct {
+	kind    PacketKind
+	payload []byte
+}
+
+func hex4Value(b []byte) int {
+	v := 0
+	for i := 0; i < 4; i++ {
+		c := b[i]
+		var n int
+		switch {
+		case c >= '0' && c <= '9':
+			n = int(c - '0')
+		case c >= 'a' && c <= 'f':
+			n = int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			n = int(c-'A') + 10
+		default:
+			panic("malformed pkt-line")
+		}
+		v = v<<4 | n
+	}
+	return v
+}
+
+func decodePktViews(buf []byte) ([]pktView, int) {
+	var views []pktView
+	pos := 0
+	for pos+4 <= len(buf) {
+		length := hex4Value(buf[pos : pos+4])
+		pos += 4
+		switch length {
+		case 0:
+			views = append(views, pktView{kind: pktFlush})
+			return views, pos
+		case 1:
+			views = append(views, pktView{kind: pktDelim})
+			continue
+		case 2:
+			views = append(views, pktView{kind: pktResponseEnd})
+			continue
+		}
+		if length < 4 || pos+length-4 > len(buf) {
+			panic("malformed pkt-line length")
+		}
+		views = append(views, pktView{kind: pktData, payload: buf[pos : pos+length-4]})
+		pos += length - 4
+	}
+	return views, pos
+}
+
+func capsHaveSideband(caps []byte) bool {
+	for len(caps) > 0 {
+		i := bytes.IndexByte(caps, ' ')
+		if i < 0 {
+			return bytes.Equal(caps, sidebandCap)
+		}
+		if bytes.Equal(caps[:i], sidebandCap) {
+			return true
+		}
+		caps = caps[i+1:]
+	}
+	return false
 }
 
 func pktLineText(s string) []byte {
@@ -736,8 +807,56 @@ func readFetchArgs(args []string) (wants, haves, shallow []string, deepen *int) 
 	return
 }
 
+func appendCacheList(key *bytes.Buffer, list []string) {
+	sorted := append([]string(nil), list...)
+	sort.Strings(sorted)
+	key.WriteByte('|')
+	key.WriteString(strconv.Itoa(len(sorted)))
+	for _, s := range sorted {
+		key.WriteByte(':')
+		key.WriteString(strconv.Itoa(len(s)))
+		key.WriteByte('=')
+		key.WriteString(s)
+	}
+}
+
+func fetchCacheKey(prefix, rev string, wants, haves, shallow []string, deepen *int) string {
+	var key bytes.Buffer
+	key.Grow(len(prefix) + len(rev) + (len(wants)+len(haves)+len(shallow))*48 + 32)
+	key.WriteString(prefix)
+	key.WriteByte('|')
+	key.WriteString(rev)
+	if deepen != nil {
+		key.WriteString("|d")
+		key.WriteString(strconv.Itoa(*deepen))
+	} else {
+		key.WriteString("|-")
+	}
+	appendCacheList(&key, wants)
+	appendCacheList(&key, haves)
+	appendCacheList(&key, shallow)
+	return key.String()
+}
+
+func (c *responseCache) putFetch(key string, body []byte) {
+	if len(c.fetch) >= maxPackCacheEntries {
+		c.fetch = make(map[string][]byte)
+		c.fetchOrder = c.fetchOrder[:0]
+	}
+	c.fetch[key] = body
+	c.fetchOrder = append(c.fetchOrder, key)
+}
+
 func fetchV2(repo *Repo, args []string) []byte {
 	wants, haves, shallow, deepen := readFetchArgs(args)
+	gitCache.mu.Lock()
+	defer gitCache.mu.Unlock()
+	rev := repoRev(repo)
+	key := fetchCacheKey("v2", rev, wants, haves, shallow, deepen)
+	gitCache.syncLocked(rev)
+	if cached := gitCache.fetch[key]; cached != nil {
+		return cached
+	}
 	sel := selectObjects(repo, wants, haves, shallow, deepen)
 	pack := writePack(repo, sel.OIDs)
 	framed := sidebandData(pack)
@@ -755,7 +874,9 @@ func fetchV2(repo *Repo, args []string) []byte {
 	out.Write(pktLineText("packfile"))
 	out.Write(framed)
 	out.Write(FlushPkt())
-	return out.Bytes()
+	result := out.Bytes()
+	gitCache.putFetch(key, result)
+	return result
 }
 
 func uploadPack(repo *Repo, body []byte) []byte {
@@ -830,6 +951,14 @@ func uploadPack(repo *Repo, body []byte) []byte {
 			haves = append(haves, firstOID(line[5:]))
 		}
 	}
+	gitCache.mu.Lock()
+	defer gitCache.mu.Unlock()
+	rev := repoRev(repo)
+	key := fetchCacheKey("v0", rev, wants, haves, shallow, deepen)
+	gitCache.syncLocked(rev)
+	if cached := gitCache.fetch[key]; cached != nil {
+		return cached
+	}
 	sel := selectObjects(repo, wants, haves, shallow, deepen)
 	pack := writePack(repo, sel.OIDs)
 	framed := sidebandData(pack)
@@ -837,7 +966,9 @@ func uploadPack(repo *Repo, body []byte) []byte {
 	out.Write(pktLineText("NAK"))
 	out.Write(framed)
 	out.Write(FlushPkt())
-	return out.Bytes()
+	result := out.Bytes()
+	gitCache.putFetch(key, result)
+	return result
 }
 
 func applyDelta(base, delta []byte) ([]byte, error) {
@@ -1152,6 +1283,30 @@ func isAllZeroOID(s string) bool {
 	return true
 }
 
+func isAllZeroOIDBytes(b []byte) bool {
+	if len(b) != 40 {
+		return false
+	}
+	for i := 0; i < 40; i++ {
+		if b[i] != '0' {
+			return false
+		}
+	}
+	return true
+}
+
+func stringBytesEqual(s string, b []byte) bool {
+	if len(s) != len(b) {
+		return false
+	}
+	for i := 0; i < len(b); i++ {
+		if s[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func wrapSideband(inner []byte, useSideband bool) []byte {
 	if !useSideband {
 		return inner
@@ -1173,42 +1328,53 @@ func wrapSideband(inner []byte, useSideband bool) []byte {
 }
 
 func receivePack(repo *Repo, body []byte) []byte {
-	decoded := DecodePackets(body)
-	packets := decoded.Packets
-	consumed := decoded.ConsumedBytes
+	views, consumed := decodePktViews(body)
 	type pushCmd struct {
-		oldOID, newOID, ref, caps string
+		oldOID, newOID, ref, caps []byte
 	}
 	var commands []pushCmd
-	for _, p := range packets {
-		if p.Kind == pktFlush {
+	for _, p := range views {
+		if p.kind == pktFlush {
 			break
 		}
-		if p.Kind != pktData {
+		if p.kind != pktData {
 			continue
 		}
-		line := stripNL(string(p.Payload))
-		nul := strings.IndexByte(line, 0)
+		line := p.payload
+		if len(line) > 0 && line[len(line)-1] == '\n' {
+			line = line[:len(line)-1]
+		}
+		nul := bytes.IndexByte(line, 0)
 		head := line
-		caps := ""
+		var caps []byte
 		if nul >= 0 {
 			head = line[:nul]
 			caps = line[nul+1:]
 		}
-		parts := strings.SplitN(head, " ", 3)
-		if len(parts) < 3 {
+		sp1 := bytes.IndexByte(head, ' ')
+		if sp1 < 0 {
 			continue
 		}
-		commands = append(commands, pushCmd{oldOID: parts[0], newOID: parts[1], ref: parts[2], caps: caps})
+		rest := head[sp1+1:]
+		sp2 := bytes.IndexByte(rest, ' ')
+		if sp2 < 0 {
+			continue
+		}
+		commands = append(commands, pushCmd{
+			oldOID: head[:sp1],
+			newOID: rest[:sp2],
+			ref:    rest[sp2+1:],
+			caps:   caps,
+		})
 	}
 	useSideband := false
 	for _, c := range commands {
-		if strings.Contains(" "+c.caps+" ", " side-band-64k ") || strings.HasPrefix(c.caps, "side-band-64k ") || strings.HasSuffix(c.caps, " side-band-64k") || c.caps == "side-band-64k" {
+		if capsHaveSideband(c.caps) {
 			useSideband = true
 			break
 		}
 	}
-	packBuf := []byte{}
+	var packBuf []byte
 	if consumed < len(body) {
 		packBuf = body[consumed:]
 	}
@@ -1236,38 +1402,39 @@ func receivePack(repo *Repo, body []byte) []byte {
 	}
 
 	for _, c := range commands {
-		if isAllZeroOID(c.newOID) {
-			if _, ok := repo.Refs[c.ref]; ok {
-				delete(repo.Refs, c.ref)
+		refKey := string(c.ref)
+		if isAllZeroOIDBytes(c.newOID) {
+			if _, ok := repo.Refs[refKey]; ok {
+				delete(repo.Refs, refKey)
 				repo.Rev++
-				report = append(report, "ok "+c.ref)
+				report = append(report, "ok "+refKey)
 			} else {
-				report = append(report, "ng "+c.ref+" delete-current-branch")
+				report = append(report, "ng "+refKey+" delete-current-branch")
 			}
 			continue
 		}
-		if isAllZeroOID(c.oldOID) {
-			if _, ok := repo.Refs[c.ref]; ok {
-				report = append(report, "ng "+c.ref+" already exists")
+		if isAllZeroOIDBytes(c.oldOID) {
+			if _, ok := repo.Refs[refKey]; ok {
+				report = append(report, "ng "+refKey+" already exists")
 				continue
 			}
-			repo.Refs[c.ref] = c.newOID
+			repo.Refs[refKey] = string(c.newOID)
 			repo.Rev++
-			report = append(report, "ok "+c.ref)
+			report = append(report, "ok "+refKey)
 			continue
 		}
-		current, ok := repo.Refs[c.ref]
-		if !ok || current != c.oldOID {
-			report = append(report, "ng "+c.ref+" fetch first")
+		current, ok := repo.Refs[refKey]
+		if !ok || !stringBytesEqual(current, c.oldOID) {
+			report = append(report, "ng "+refKey+" fetch first")
 			continue
 		}
-		if !strings.HasPrefix(c.ref, "refs/tags/") && !isAncestorRepo(repo, c.oldOID, c.newOID) {
-			report = append(report, "ng "+c.ref+" non-fast-forward")
+		if !strings.HasPrefix(refKey, "refs/tags/") && !isAncestorRepo(repo, string(c.oldOID), string(c.newOID)) {
+			report = append(report, "ng "+refKey+" non-fast-forward")
 			continue
 		}
-		repo.Refs[c.ref] = c.newOID
+		repo.Refs[refKey] = string(c.newOID)
 		repo.Rev++
-		report = append(report, "ok "+c.ref)
+		report = append(report, "ok "+refKey)
 	}
 	var inner bytes.Buffer
 	for _, l := range report {

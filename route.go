@@ -31,13 +31,22 @@ func (a *App) nextRequestID() string {
 	return "req-" + strconv.FormatUint(a.reqSeq.Add(1), 10)
 }
 
-func (a *App) sendJSON(w http.ResponseWriter, status int, body []byte) {
-	w.Header().Set("Content-Type", "application/json")
+func (a *App) sendPrepared(w http.ResponseWriter, status int, contentType string, body []byte) {
+	bodyLen := 0
+	if body != nil && status != http.StatusNoContent {
+		bodyLen = len(body)
+	}
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("X-GitHub-Request-Id", a.nextRequestID())
+	w.Header().Set("Content-Length", strconv.Itoa(bodyLen))
 	w.WriteHeader(status)
 	if body != nil && status != http.StatusNoContent {
 		_, _ = w.Write(body)
 	}
+}
+
+func (a *App) sendJSON(w http.ResponseWriter, status int, body []byte) {
+	a.sendPrepared(w, status, "application/json", body)
 }
 
 func (a *App) sendError(w http.ResponseWriter, status int, message string) {
@@ -178,6 +187,60 @@ func (a *App) readAPIBody(w http.ResponseWriter, r *http.Request, method string)
 	return obj, true
 }
 
+func fastIssuePath(pathname string) (owner, repo string, number int, ok bool) {
+	const prefix = "/api/v3/repos/"
+	if !strings.HasPrefix(pathname, prefix) || strings.IndexByte(pathname, '%') >= 0 {
+		return "", "", 0, false
+	}
+	rest := pathname[len(prefix):]
+	i := strings.IndexByte(rest, '/')
+	if i <= 0 {
+		return "", "", 0, false
+	}
+	owner = rest[:i]
+	rest = rest[i+1:]
+	i = strings.IndexByte(rest, '/')
+	if i <= 0 {
+		return "", "", 0, false
+	}
+	repo = rest[:i]
+	rest = rest[i+1:]
+	const issues = "issues/"
+	if !strings.HasPrefix(rest, issues) {
+		return "", "", 0, false
+	}
+	numStr := rest[len(issues):]
+	if numStr == "" || strings.IndexByte(numStr, '/') >= 0 {
+		return "", "", 0, false
+	}
+	parsed, err := strconv.Atoi(numStr)
+	if err != nil {
+		return "", "", 0, false
+	}
+	return owner, repo, parsed, true
+}
+
+func (a *App) tryFastIssueGET(w http.ResponseWriter, r *http.Request, method, pathname string) bool {
+	if method != http.MethodGet {
+		return false
+	}
+	owner, name, number, ok := fastIssuePath(pathname)
+	if !ok || !a.isAuthed(r) {
+		return false
+	}
+	store := a.Store
+	repo := store.GetRepo(owner, name)
+	if repo == nil {
+		return false
+	}
+	issue := repo.FindIssue(number)
+	if issue == nil {
+		return false
+	}
+	a.sendPrepared(w, http.StatusOK, "application/json", CachedIssueJSON(repo, store, issue))
+	return true
+}
+
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if recover() != nil {
@@ -198,12 +261,16 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if i := strings.IndexByte(rawURL, '?'); i >= 0 {
 		query = rawURL[i+1:]
 	}
-	segs := pathSegments(pathname)
-
 	if method == http.MethodGet && pathname == "/healthz" {
 		a.sendJSON(w, http.StatusOK, []byte(`{"ok":true}`))
 		return
 	}
+
+	if a.tryFastIssueGET(w, r, method, pathname) {
+		return
+	}
+
+	segs := pathSegments(pathname)
 
 	if pathname == "/api/v3" || strings.HasPrefix(pathname, "/api/v3/") {
 		if !a.isAuthed(r) {
